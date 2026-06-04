@@ -1,0 +1,225 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Actions: OWASP API Security + DevSecOps Pipeline
+#
+# Stages:
+#   1. sast          — Semgrep SAST + Bandit static analysis
+#   2. dependency    — pip-audit (OWASP dependency check equivalent)
+#   3. container     — Docker build + Trivy container scan
+#   4. security-test — Run full pytest OWASP suite against live API
+#   5. report        — Upload all scan artifacts
+#
+# Fails the build if HIGH severity issues are found in SAST or container scan.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: owasp-api-scanner
+
+jobs:
+  # ── Job 1: SAST ─────────────────────────────────────────────────────────────
+  sast:
+    name: "SAST — Semgrep + Bandit"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required for uploading SARIF to GitHub Security tab
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ── Semgrep ──
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep (OWASP / security ruleset)
+        run: |
+          semgrep scan \
+            --config "p/owasp-top-ten" \
+            --config "p/python" \
+            --config "p/flask" \
+            --sarif \
+            --output reports/semgrep.sarif \
+            --severity ERROR \
+            --severity WARNING \
+            . || true   # don't fail here; upload results first
+        # Note: remove "|| true" in production to gate on Semgrep findings
+
+      - name: Upload Semgrep SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+      # ── Bandit ──
+      - name: Install Bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit (Python security linter)
+        run: |
+          bandit \
+            -r app/ \
+            -f json \
+            -o reports/bandit.json \
+            --severity-level medium \
+            --confidence-level medium \
+            -ll || true
+
+      - name: Parse Bandit results and fail on HIGH severity
+        run: |
+          python scripts/parse_bandit.py reports/bandit.json
+
+      - name: Upload SAST reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-reports
+          path: reports/
+
+  # ── Job 2: Dependency Scanning ───────────────────────────────────────────────
+  dependency-scan:
+    name: "Dependency Scan — pip-audit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit (OWASP Dependency Check equivalent)
+        run: |
+          pip install -r requirements.txt
+          pip-audit \
+            --requirement requirements.txt \
+            --format json \
+            --output reports/pip-audit.json \
+            --strict || true
+
+      - name: Fail on CRITICAL/HIGH CVEs
+        run: python scripts/parse_pip_audit.py reports/pip-audit.json
+
+      - name: Upload dependency report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-report
+          path: reports/pip-audit.json
+
+  # ── Job 3: Container Scan ────────────────────────────────────────────────────
+  container-scan:
+    name: "Container Scan — Trivy"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          format: "sarif"
+          output: "reports/trivy.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"        # FAIL build on CRITICAL/HIGH CVEs in container
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: reports/trivy.sarif
+          category: trivy
+
+      - name: Upload container scan report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-scan-report
+          path: reports/trivy.sarif
+
+  # ── Job 4: OWASP Security Tests ──────────────────────────────────────────────
+  security-tests:
+    name: "OWASP API Security Tests — pytest"
+    runs-on: ubuntu-latest
+    needs: [sast]          # run after SAST passes
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-html pytest-json-report
+
+      - name: Create reports directory
+        run: mkdir -p reports
+
+      - name: Run OWASP security test suite
+        run: |
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --html=reports/security-test-report.html \
+            --self-contained-html \
+            --json-report \
+            --json-report-file=reports/security-test-report.json \
+            -p no:cacheprovider
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-test-reports
+          path: reports/
+
+  # ── Job 5: Pipeline Summary ──────────────────────────────────────────────────
+  pipeline-summary:
+    name: "Pipeline Summary"
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan, container-scan, security-tests]
+    if: always()
+
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Print pipeline summary
+        run: |
+          echo "## DevSecOps Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep + Bandit) | ${{ needs.sast.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Scan (pip-audit) | ${{ needs.dependency-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Scan (Trivy) | ${{ needs.container-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OWASP API Security Tests | ${{ needs.security-tests.result }} |" >> $GITHUB_STEP_SUMMARY

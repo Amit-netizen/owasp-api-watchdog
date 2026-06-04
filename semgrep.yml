@@ -1,0 +1,69 @@
+# semgrep.yml — local Semgrep rules for OWASP-specific patterns
+# Used in addition to p/owasp-top-ten and p/flask rulesets
+rules:
+
+  - id: hardcoded-jwt-secret
+    patterns:
+      - pattern: |
+          JWT_SECRET = "$SECRET"
+    message: |
+      Hardcoded JWT secret detected: '$SECRET'.
+      OWASP API2:2023 — Broken Authentication.
+      Use environment variables: os.environ.get('JWT_SECRET')
+    severity: ERROR
+    languages: [python]
+    metadata:
+      owasp: "API2:2023"
+      cwe: "CWE-798"
+
+  - id: sql-injection-string-format
+    patterns:
+      - pattern: |
+          $DB.execute(f"... {$VAR} ...")
+      - pattern: |
+          $DB.execute("..." + $VAR + "...")
+    message: |
+      Potential SQL injection via string interpolation.
+      OWASP API10:2023 — Injection.
+      Use parameterized queries: db.execute("SELECT ... WHERE x=?", (val,))
+    severity: ERROR
+    languages: [python]
+    metadata:
+      owasp: "API10:2023"
+      cwe: "CWE-89"
+
+  - id: flask-debug-true
+    pattern: |
+      app.run(..., debug=True, ...)
+    message: |
+      Flask running with debug=True.
+      OWASP API8:2023 — Security Misconfiguration.
+      Never enable debug mode in production.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      owasp: "API8:2023"
+      cwe: "CWE-94"
+
+  - id: missing-authorization-check
+    patterns:
+      - pattern: |
+          @$APP.route(...)
+          def $FUNC(...):
+            ...
+            return jsonify(...)
+      - pattern-not: |
+          @$APP.route(...)
+          def $FUNC(...):
+            ...
+            if not $CALLER:
+              return ...
+            ...
+    message: |
+      Route handler may be missing authorization check.
+      OWASP API1:2023 / API5:2023 — Broken Authorization.
+      Ensure every protected route verifies the caller's identity and permissions.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      owasp: "API1:2023"
